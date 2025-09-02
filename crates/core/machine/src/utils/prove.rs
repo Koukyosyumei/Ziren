@@ -8,14 +8,20 @@ use std::{
 use web_time::Instant;
 
 use crate::mips::MipsAir;
+use crate::MAX_CPU_LOG_DEGREE;
+use p3_field::FieldAlgebra;
 use p3_maybe_rayon::prelude::*;
 use p3_uni_stark::SymbolicAirBuilder;
 use serde::{de::DeserializeOwned, Serialize};
 use size::Size;
+use std::borrow::Borrow;
 use std::thread::ScopedJoinHandle;
 use thiserror::Error;
+use zkm_primitives::{consts::WORD_SIZE, io::ZKMPublicValues};
+use zkm_stark::Word;
 use zkm_stark::{
-    koala_bear_poseidon2::KoalaBearPoseidon2, MachineProvingKey, MachineVerificationError,
+    air::POSEIDON_NUM_WORDS, air::PV_DIGEST_NUM_WORDS, koala_bear_poseidon2::KoalaBearPoseidon2,
+    MachineProvingKey, MachineVerificationError,
 };
 
 use p3_field::PrimeField32;
@@ -32,7 +38,6 @@ use zkm_core_executor::{
     ExecutionError, ExecutionRecord, ExecutionReport, ExecutionState, Executor, Program,
     ZKMContext,
 };
-use zkm_primitives::io::ZKMPublicValues;
 
 use zkm_stark::{
     air::{MachineAir, PublicValues},
@@ -533,6 +538,156 @@ pub fn run_test_core<P: MachineProver<KoalaBearPoseidon2, MipsAir<KoalaBear>>>(
     let machine = MipsAir::machine(config);
     let (pk, vk) = machine.setup(runtime.program.as_ref());
     let mut challenger = machine.config().challenger();
+    println!("public values: {:?}", proof.shard_proofs[proof.shard_proofs.len() - 1].public_values);
+
+    if proof.shard_proofs.is_empty() {
+        return Err(MachineVerificationError::EmptyProof);
+    }
+
+    let first_shard = proof.shard_proofs.first().unwrap();
+    if !first_shard.contains_cpu() {
+        return Err(MachineVerificationError::MissingCpuInFirstShard);
+    }
+
+    for shard_proof in proof.shard_proofs.iter() {
+        if shard_proof.contains_cpu() {
+            let log_degree_cpu = shard_proof.log_degree_cpu();
+            if log_degree_cpu > MAX_CPU_LOG_DEGREE {
+                return Err(MachineVerificationError::CpuLogDegreeTooLarge(log_degree_cpu));
+            }
+        }
+    }
+
+    let mut current_shard = KoalaBear::ZERO;
+    for shard_proof in proof.shard_proofs.iter() {
+        let public_values: &PublicValues<Word<_>, _> =
+            shard_proof.public_values.as_slice().borrow();
+        current_shard += KoalaBear::ONE;
+        if public_values.shard != current_shard {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "shard index should be the previous shard index + 1 and start at 1",
+            ));
+        }
+    }
+
+    let mut current_execution_shard = KoalaBear::ZERO;
+    for shard_proof in proof.shard_proofs.iter() {
+        let public_values: &PublicValues<Word<_>, _> =
+            shard_proof.public_values.as_slice().borrow();
+        if shard_proof.contains_cpu() {
+            current_execution_shard += KoalaBear::ONE;
+            if public_values.execution_shard != current_execution_shard {
+                return Err(MachineVerificationError::InvalidPublicValues(
+                        "execution shard index should be the previous execution shard index + 1 if cpu exists and start at 1",
+                    ));
+            }
+        }
+    }
+
+    let mut prev_next_pc = KoalaBear::ZERO;
+    for (i, shard_proof) in proof.shard_proofs.iter().enumerate() {
+        let public_values: &PublicValues<Word<_>, _> =
+            shard_proof.public_values.as_slice().borrow();
+        if i == 0 && public_values.start_pc != vk.pc_start {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "start_pc != vk.start_pc: program counter should start at vk.start_pc",
+            ));
+        } else if i != 0 && public_values.start_pc != prev_next_pc {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "start_pc != next_pc_prev: start_pc should equal next_pc_prev for all shards",
+            ));
+        } else if !shard_proof.contains_cpu() && public_values.start_pc != public_values.next_pc {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "start_pc != next_pc: start_pc should equal next_pc for non-cpu shards",
+            ));
+        } else if shard_proof.contains_cpu() && public_values.start_pc == KoalaBear::ZERO {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "start_pc == 0: execution should never start at halted state",
+            ));
+        } else if i == proof.shard_proofs.len() - 1 && public_values.next_pc != KoalaBear::ZERO {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "next_pc != 0: execution should have halted",
+            ));
+        }
+        prev_next_pc = public_values.next_pc;
+    }
+
+    let mut last_init_addr_bits_prev = [KoalaBear::ZERO; 32];
+    let mut last_finalize_addr_bits_prev = [KoalaBear::ZERO; 32];
+    for shard_proof in proof.shard_proofs.iter() {
+        let public_values: &PublicValues<Word<_>, _> =
+            shard_proof.public_values.as_slice().borrow();
+        if public_values.previous_init_addr_bits != last_init_addr_bits_prev {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "previous_init_addr_bits != last_init_addr_bits_prev",
+            ));
+        } else if public_values.previous_finalize_addr_bits != last_finalize_addr_bits_prev {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "last_init_addr_bits != last_finalize_addr_bits_prev",
+            ));
+        } else if !shard_proof.contains_global_memory_init()
+            && public_values.previous_init_addr_bits != public_values.last_init_addr_bits
+        {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "previous_init_addr_bits != last_init_addr_bits",
+            ));
+        } else if !shard_proof.contains_global_memory_finalize()
+            && public_values.previous_finalize_addr_bits != public_values.last_finalize_addr_bits
+        {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "previous_finalize_addr_bits != last_finalize_addr_bits",
+            ));
+        }
+        last_init_addr_bits_prev = public_values.last_init_addr_bits;
+        last_finalize_addr_bits_prev = public_values.last_finalize_addr_bits;
+    }
+
+    let zero_committed_value_digest = [Word([KoalaBear::ZERO; WORD_SIZE]); PV_DIGEST_NUM_WORDS];
+    let zero_deferred_proofs_digest = [KoalaBear::ZERO; POSEIDON_NUM_WORDS];
+    let mut committed_value_digest_prev = zero_committed_value_digest;
+    let mut deferred_proofs_digest_prev = zero_deferred_proofs_digest;
+    for shard_proof in proof.shard_proofs.iter() {
+        let public_values: &PublicValues<Word<_>, _> =
+            shard_proof.public_values.as_slice().borrow();
+        if committed_value_digest_prev != zero_committed_value_digest
+            && public_values.committed_value_digest != committed_value_digest_prev
+        {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "committed_value_digest != committed_value_digest_prev",
+            ));
+        } else if deferred_proofs_digest_prev != zero_deferred_proofs_digest
+            && public_values.deferred_proofs_digest != deferred_proofs_digest_prev
+        {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "deferred_proofs_digest != deferred_proofs_digest_prev",
+            ));
+        } else if !shard_proof.contains_cpu()
+            && public_values.committed_value_digest != committed_value_digest_prev
+        {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "committed_value_digest != committed_value_digest_prev",
+            ));
+        } else if !shard_proof.contains_cpu()
+            && public_values.deferred_proofs_digest != deferred_proofs_digest_prev
+        {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "deferred_proofs_digest != deferred_proofs_digest_prev",
+            ));
+        }
+        committed_value_digest_prev = public_values.committed_value_digest;
+        deferred_proofs_digest_prev = public_values.deferred_proofs_digest;
+    }
+
+    for shard_proof in proof.shard_proofs.iter() {
+        let public_values: &PublicValues<Word<_>, _> =
+            shard_proof.public_values.as_slice().borrow();
+        if public_values.exit_code != KoalaBear::ZERO {
+            return Err(MachineVerificationError::InvalidPublicValues(
+                "exit_code != 0: exit code should be zero for all shards",
+            ));
+        }
+    }
+
     machine.verify(&vk, &proof, &mut challenger).unwrap();
 
     Ok(proof)

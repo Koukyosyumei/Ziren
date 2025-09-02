@@ -141,6 +141,7 @@ pub trait Prover<C: ZKMProverComponents>: Send + Sync {
             ZKMProof::Core(proof) => {
                 let public_values: &PublicValues<Word<_>, _> =
                     proof.last().unwrap().public_values.as_slice().borrow();
+                println!("public values: {:?}", public_values);
 
                 // Get the committed value digest bytes.
                 let committed_value_digest_bytes = public_values
