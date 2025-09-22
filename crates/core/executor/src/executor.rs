@@ -1867,7 +1867,7 @@ impl<'a> Executor<'a> {
             }
         }
 
-        let done = self.state.pc == 0
+        let done = self.state.pc % 2130706433 == 0
             || self.state.exited
             || self.state.pc.wrapping_sub(self.program.pc_base)
                 >= (self.program.instructions.len() * 4) as u32;
@@ -2048,11 +2048,6 @@ impl<'a> Executor<'a> {
                 break;
             }
             println!("i: {} - pc: {}", i, self.state.pc);
-
-            if i >= 10 {
-                done = true;
-                break;
-            }
 
             if self.shard_batch_size > 0 && current_shard != self.state.current_shard {
                 num_shards_executed += 1;
