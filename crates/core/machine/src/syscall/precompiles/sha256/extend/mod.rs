@@ -62,7 +62,7 @@ pub mod extend_tests {
             Instruction::new(Opcode::ADD, 4, 0, 0, false, true),
             Instruction::new(Opcode::SYSCALL, 2, 4, 5, false, false),
         ]);
-        Program::new(instructions, 1, 1) //2130705869 + 32, 2130705869 + 32
+        Program::new(instructions, 2130706393, 2130706393) //2130706433 - 41
     }
 
     #[test]
@@ -80,7 +80,7 @@ pub mod extend_tests {
         utils::setup_logger();
         let program = sha_extend_program();
         run_test::<CpuProver<_, _>>(program).unwrap();
-        assert!(false);
+        assert!(false, "verification should fail");
     }
 
     #[test]

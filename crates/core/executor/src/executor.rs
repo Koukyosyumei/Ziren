@@ -2033,14 +2033,14 @@ impl<'a> Executor<'a> {
             i += 1;
             if self.execute_cycle()? {
                 done = true;
-                println!("D: {} - {}", i, self.state.pc);
+                println!("i: {} - pc: {}", i, self.state.pc);
                 break;
             }
-            println!("i: {} - {}", i, self.state.pc);
+            println!("i: {} - pc: {}", i, self.state.pc);
 
             if i >= 10 {
-                //done = true;
-                //break;
+                done = true;
+                break;
             }
 
             if self.shard_batch_size > 0 && current_shard != self.state.current_shard {
